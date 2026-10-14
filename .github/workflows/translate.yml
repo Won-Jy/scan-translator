@@ -1,0 +1,51 @@
+name: 스캔 번역
+
+on:
+  repository_dispatch:
+    types: [translate-pdf]
+  workflow_dispatch:
+    inputs:
+      file_id:        { description: "Drive 원문 PDF 파일 ID", required: true }
+      file_name:      { description: "파일 이름 (예: Fleury_ch1.pdf)", required: true }
+      out_folder_id:  { description: "02_Translated 폴더 ID", required: true }
+      work_folder_id: { description: "_work 폴더 ID", required: true }
+      glossary_file_id: { description: "glossary.txt 파일 ID (선택)", required: false }
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # 같은 파일이 두 번 들어오면 하나만 실행
+    concurrency:
+      group: translate-${{ github.event.client_payload.file_id || inputs.file_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 폰트 캐시
+        uses: actions/cache@v4
+        with:
+          path: fonts
+          key: fonts-nanummyeongjo-v1
+
+      - name: 번역 실행
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_SECRET: ${{ secrets.GAS_SECRET }}
+          JOB_FILE_ID: ${{ github.event.client_payload.file_id || inputs.file_id }}
+          JOB_FILE_NAME: ${{ github.event.client_payload.file_name || inputs.file_name }}
+          JOB_OUT_FOLDER_ID: ${{ github.event.client_payload.out_folder_id || inputs.out_folder_id }}
+          JOB_WORK_FOLDER_ID: ${{ github.event.client_payload.work_folder_id || inputs.work_folder_id }}
+          JOB_GLOSSARY_FILE_ID: ${{ github.event.client_payload.glossary_file_id || inputs.glossary_file_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PYTHONUNBUFFERED: "1"
+        run: python job.py
