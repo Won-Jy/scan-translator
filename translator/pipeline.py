@@ -4,6 +4,7 @@ work(dict)에 중간 결과를 쌓아 두므로, 도중에 실패해도 다시 �
 끝난 페이지는 건너뛰고 이어서 처리한다.
 한두 페이지가 끝내 실패해도 책 전체는 완성되고, 그 페이지에는 원문이 들어간다.
 """
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,13 +36,14 @@ def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list
 
     errors(list)를 넘기면 실패 원인 문구를 모아 둔다 (실패 메일에 원인을 보여주기 위해).
     """
-    failed, done = [], 0
+    failed, done, ok, bad_req = [], 0, 0, 0
     with ThreadPoolExecutor(config.WORKERS) as ex:
         futs = {ex.submit(fn, i): i for i in items}
         for f in as_completed(futs):
             i = futs[f]
             try:
                 store[str(i)] = f.result()
+                ok += 1
             except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
                 # API 키 문제 — 나머지 페이지도 전부 실패하므로 바로 중단
                 for other in futs:
@@ -50,10 +52,17 @@ def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list
                     "Anthropic API 키가 거부되었습니다. GitHub Secrets의 ANTHROPIC_API_KEY를 "
                     f"확인하세요 ({type(e).__name__}: {e})") from e
             except Exception as e:  # noqa: BLE001
+                if isinstance(e, anthropic.BadRequestError):
+                    bad_req += 1
+                    if ok == 0 and bad_req >= 3:
+                        # 요청 형식 자체가 거부됨 — 모든 페이지가 똑같이 실패하므로 바로 중단
+                        for other in futs:
+                            other.cancel()
+                        raise RuntimeError(f"API가 요청을 거부했습니다: {e}") from e
                 failed.append(i)
                 log(f"  [실패] {label} {i + 1}쪽: {type(e).__name__}: {e}")
                 if errors is not None:
-                    errors.append(f"{type(e).__name__}: {e}")
+                    errors.append(re.sub(r",?\s*'request_id':\s*'[^']*'", "", f"{type(e).__name__}: {e}"))
             done += 1
             if done % 10 == 0:
                 log(f"  {label} {done}/{len(items)}")
