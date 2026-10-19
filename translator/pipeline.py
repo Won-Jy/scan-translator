@@ -31,10 +31,18 @@ def _context_tail(p: dict, n: int = 2) -> str:
     return "\n".join(body[-n:])[-700:]
 
 
-def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list[int]:
+def _is_blocked(e: Exception) -> bool:
+    """API의 출력 필터에 걸린 경우 (페이지 내용 때문 — 다시 시도해도 같은 결과)."""
+    return isinstance(e, anthropic.BadRequestError) and "content filtering" in str(e)
+
+
+def _run_parallel(items, fn, store, label, log, checkpoint, errors=None,
+                  blocked=None, blocked_value=None) -> list[int]:
     """fn(i)를 병렬 실행해 store[str(i)]에 저장. 실패한 i 목록을 반환.
 
     errors(list)를 넘기면 실패 원인 문구를 모아 둔다 (실패 메일에 원인을 보여주기 위해).
+    출력 필터에 걸린 페이지는 실패로 세지 않고 blocked(list)에 모은 뒤 store에 blocked_value를
+    기록한다 — 조판 때 그 쪽은 원문 페이지가 들어가고, 재실행해도 다시 요청하지 않는다.
     """
     failed, done, ok, bad_req = [], 0, 0, 0
     with ThreadPoolExecutor(config.WORKERS) as ex:
@@ -52,6 +60,12 @@ def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list
                     "Anthropic API 키가 거부되었습니다. GitHub Secrets의 ANTHROPIC_API_KEY를 "
                     f"확인하세요 ({type(e).__name__}: {e})") from e
             except Exception as e:  # noqa: BLE001
+                if _is_blocked(e) and blocked is not None:
+                    blocked.append(i)
+                    store[str(i)] = blocked_value
+                    log(f"  [건너뜀] {label} {i + 1}쪽: 출력 필터에 걸려 원문 페이지로 둡니다")
+                    done += 1
+                    continue
                 if isinstance(e, anthropic.BadRequestError):
                     bad_req += 1
                     if ok == 0 and bad_req >= 3:
@@ -107,8 +121,10 @@ def run_pipeline(
     log(f"[1/4] 페이지 전사: {n}쪽 중 {len(todo)}쪽 처리")
     images = {i: render_page_jpeg(src[i]) for i in todo}
     ocr_errors: list[str] = []
+    blocked_pages: list[int] = []
     failed_ocr = _run_parallel(todo, lambda i: transcribe_page(images[i], i + 1, n),
-                               work["pages"], "전사", log, checkpoint, ocr_errors)
+                               work["pages"], "전사", log, checkpoint, ocr_errors,
+                               blocked_pages, dict(FAILED_PAGE, blocked=True))
     images.clear()
     if len(failed_ocr) > max(3, n // 5):
         raise RuntimeError(f"전사 실패 {len(failed_ocr)}/{len(todo)}쪽{_cause(ocr_errors)}")
@@ -148,8 +164,10 @@ def run_pipeline(
     failed_tr, tr_errors = [], []
     if todo:
         # 첫 페이지를 먼저 처리해 프롬프트 캐시를 데운 뒤 나머지를 병렬로
-        failed_tr += _run_parallel(todo[:1], job, work["translations"], "번역", log, lambda: None, tr_errors)
-        failed_tr += _run_parallel(todo[1:], job, work["translations"], "번역", log, checkpoint, tr_errors)
+        failed_tr += _run_parallel(todo[:1], job, work["translations"], "번역", log, lambda: None,
+                                   tr_errors, blocked_pages, None)
+        failed_tr += _run_parallel(todo[1:], job, work["translations"], "번역", log, checkpoint,
+                                   tr_errors, blocked_pages, None)
     if len(failed_tr) > max(3, len(todo) // 5):
         # API 크레딧 소진 등 — 원문투성이 PDF를 내보내지 말고 중단 (재실행하면 이어서 처리)
         raise RuntimeError(f"번역 실패 {len(failed_tr)}/{len(todo)}쪽{_cause(tr_errors)}")
@@ -170,7 +188,9 @@ def run_pipeline(
     report = {
         "pages": n,
         "seconds": round(time.time() - t0),
-        "failed_pages": sorted({i + 1 for i in failed_ocr + failed_tr}),
+        "failed_pages": sorted({i + 1 for i in failed_ocr + failed_tr}
+                               | {int(k) + 1 for k, v in work["pages"].items() if v.get("blocked")}
+                               | {int(k) + 1 for k, v in work["translations"].items() if v is None}),
         "title": g.get("title", ""),
         "author": g.get("author", ""),
     }
