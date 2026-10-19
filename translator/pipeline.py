@@ -29,8 +29,11 @@ def _context_tail(p: dict, n: int = 2) -> str:
     return "\n".join(body[-n:])[-700:]
 
 
-def _run_parallel(items, fn, store, label, log, checkpoint) -> list[int]:
-    """fn(i)를 병렬 실행해 store[str(i)]에 저장. 실패한 i 목록을 반환."""
+def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list[int]:
+    """fn(i)를 병렬 실행해 store[str(i)]에 저장. 실패한 i 목록을 반환.
+
+    errors(list)를 넘기면 실패 원인 문구를 모아 둔다 (실패 메일에 원인을 보여주기 위해).
+    """
     failed, done = [], 0
     with ThreadPoolExecutor(config.WORKERS) as ex:
         futs = {ex.submit(fn, i): i for i in items}
@@ -40,13 +43,23 @@ def _run_parallel(items, fn, store, label, log, checkpoint) -> list[int]:
                 store[str(i)] = f.result()
             except Exception as e:  # noqa: BLE001
                 failed.append(i)
-                log(f"  [실패] {label} {i + 1}쪽: {e}")
+                log(f"  [실패] {label} {i + 1}쪽: {type(e).__name__}: {e}")
+                if errors is not None:
+                    errors.append(f"{type(e).__name__}: {e}")
             done += 1
             if done % 10 == 0:
                 log(f"  {label} {done}/{len(items)}")
                 checkpoint()
     checkpoint()
     return sorted(failed)
+
+
+def _cause(errors: list[str]) -> str:
+    """가장 많이 나온 실패 원인 한 줄."""
+    if not errors:
+        return ""
+    top = max(set(errors), key=errors.count)
+    return f" — 원인({errors.count(top)}건): {top[:400]}"
 
 
 def run_pipeline(
@@ -72,11 +85,12 @@ def run_pipeline(
     todo = [i for i in range(n) if str(i) not in work["pages"]]
     log(f"[1/4] 페이지 전사: {n}쪽 중 {len(todo)}쪽 처리")
     images = {i: render_page_jpeg(src[i]) for i in todo}
+    ocr_errors: list[str] = []
     failed_ocr = _run_parallel(todo, lambda i: transcribe_page(images[i], i + 1, n),
-                               work["pages"], "전사", log, checkpoint)
+                               work["pages"], "전사", log, checkpoint, ocr_errors)
     images.clear()
     if len(failed_ocr) > max(3, n // 5):
-        raise RuntimeError(f"전사 실패 페이지가 너무 많습니다: {[i + 1 for i in failed_ocr]}")
+        raise RuntimeError(f"전사 실패 {len(failed_ocr)}/{len(todo)}쪽{_cause(ocr_errors)}")
     pages = [work["pages"].get(str(i), FAILED_PAGE) for i in range(n)]
 
     # ── 2. 용어집 ────────────────────────────
@@ -110,14 +124,14 @@ def run_pipeline(
             if str(i) not in work["translations"]
             and pages[i]["page_kind"] not in NO_TRANSLATE and pages[i]["blocks"]]
     log(f"[3/4] 번역: {len(todo)}쪽")
-    failed_tr = []
+    failed_tr, tr_errors = [], []
     if todo:
         # 첫 페이지를 먼저 처리해 프롬프트 캐시를 데운 뒤 나머지를 병렬로
-        failed_tr += _run_parallel(todo[:1], job, work["translations"], "번역", log, lambda: None)
-        failed_tr += _run_parallel(todo[1:], job, work["translations"], "번역", log, checkpoint)
+        failed_tr += _run_parallel(todo[:1], job, work["translations"], "번역", log, lambda: None, tr_errors)
+        failed_tr += _run_parallel(todo[1:], job, work["translations"], "번역", log, checkpoint, tr_errors)
     if len(failed_tr) > max(3, len(todo) // 5):
         # API 크레딧 소진 등 — 원문투성이 PDF를 내보내지 말고 중단 (재실행하면 이어서 처리)
-        raise RuntimeError(f"번역 실패 페이지가 너무 많습니다: {[i + 1 for i in failed_tr]}")
+        raise RuntimeError(f"번역 실패 {len(failed_tr)}/{len(todo)}쪽{_cause(tr_errors)}")
 
     # ── 4. 조판 ──────────────────────────────
     log("[4/4] PDF 조판")
