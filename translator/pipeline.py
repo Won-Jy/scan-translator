@@ -95,8 +95,12 @@ def run_pipeline(
     t0 = time.time()
 
     def checkpoint():
+        # 중간 저장 실패(Drive 일시 오류)로 번역 전체를 멈추지 않는다 — 다음 저장 때 다시 시도
         with lock:
-            save(work)
+            try:
+                save(work)
+            except Exception as e:  # noqa: BLE001
+                log(f"  [경고] 중간 결과 저장 실패 (계속 진행): {e}")
 
     # ── 1. 전사 ──────────────────────────────
     todo = [i for i in range(n) if str(i) not in work["pages"]]
