@@ -13,10 +13,12 @@ _client = None
 def client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        # 붙여넣을 때 섞인 공백·줄바꿈·따옴표 제거
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip().strip('"').strip("'").strip()
+        if not key:
             raise RuntimeError("ANTHROPIC_API_KEY 환경변수가 없습니다.")
         # SDK가 429/529(과부하)·네트워크 오류를 지수 백오프로 자동 재시도
-        _client = anthropic.Anthropic(max_retries=8, timeout=600)
+        _client = anthropic.Anthropic(api_key=key, max_retries=8, timeout=600)
     return _client
 
 

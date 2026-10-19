@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
+import anthropic
 import pymupdf as fitz
 
 from . import config
@@ -41,6 +42,13 @@ def _run_parallel(items, fn, store, label, log, checkpoint, errors=None) -> list
             i = futs[f]
             try:
                 store[str(i)] = f.result()
+            except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
+                # API 키 문제 — 나머지 페이지도 전부 실패하므로 바로 중단
+                for other in futs:
+                    other.cancel()
+                raise RuntimeError(
+                    "Anthropic API 키가 거부되었습니다. GitHub Secrets의 ANTHROPIC_API_KEY를 "
+                    f"확인하세요 ({type(e).__name__}: {e})") from e
             except Exception as e:  # noqa: BLE001
                 failed.append(i)
                 log(f"  [실패] {label} {i + 1}쪽: {type(e).__name__}: {e}")
