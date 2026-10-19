@@ -15,6 +15,7 @@ import pymupdf as fitz
 
 from . import config
 from .glossary import build_glossary, glossary_for_prompt
+from .direct import translate_page_image
 from .render import render_book
 from .transcribe import render_page_jpeg, transcribe_page
 from .translate import build_system, translate_page
@@ -63,7 +64,7 @@ def _run_parallel(items, fn, store, label, log, checkpoint, errors=None,
                 if _is_blocked(e) and blocked is not None:
                     blocked.append(i)
                     store[str(i)] = blocked_value
-                    log(f"  [건너뜀] {label} {i + 1}쪽: 출력 필터에 걸려 원문 페이지로 둡니다")
+                    log(f"  [필터] {label} {i + 1}쪽: 출력 필터에 걸림 (기록해 두고 다음 단계에서 처리)")
                     done += 1
                     continue
                 if isinstance(e, anthropic.BadRequestError):
@@ -136,6 +137,7 @@ def run_pipeline(
         work["glossary"] = build_glossary(pages, user_terms)
         work["user_terms"] = user_terms
         work["translations"] = {}  # 용어가 바뀌면 번역도 다시
+        work["direct"] = {}
         checkpoint()
     else:
         log("[2/4] 용어집: 저장된 것 사용")
@@ -172,25 +174,61 @@ def run_pipeline(
         # API 크레딧 소진 등 — 원문투성이 PDF를 내보내지 말고 중단 (재실행하면 이어서 처리)
         raise RuntimeError(f"번역 실패 {len(failed_tr)}/{len(todo)}쪽{_cause(tr_errors)}")
 
+    # ── 3+. 보조 번역: 필터에 걸린 페이지는 이미지에서 바로 한국어로 ──
+    direct = work.setdefault("direct", {})
+    need = [i for i in range(n) if str(i) not in direct and (
+        pages[i].get("blocked")
+        or (str(i) in work["translations"] and work["translations"][str(i)] is None))]
+    if need:
+        log(f"[3/4] 보조 번역 (원문 전사 없이 이미지 → 한국어): {len(need)}쪽")
+        gp = glossary_for_prompt(g)
+        dimages = {i: render_page_jpeg(src[i]) for i in need}
+
+        def prev_tail(i: int) -> str:
+            if i == 0:
+                return ""
+            t = work["translations"].get(str(i - 1))
+            if t:
+                body = [x for x, b in zip(t, pages[i - 1]["blocks"]) if b["type"] != "footnote" and x]
+                return "\n".join(body[-2:])[-400:]
+            d = direct.get(str(i - 1))
+            if d and d.get("blocks"):
+                return "\n".join(b["text"] for b in d["blocks"] if b["type"] != "footnote")[-400:]
+            return ""
+
+        direct_blocked: list[int] = []
+        _run_parallel(need, lambda i: translate_page_image(gp, dimages[i], i + 1, n, prev_tail(i)),
+                      direct, "보조 번역", log, checkpoint, None, direct_blocked, {"blocked": True})
+        dimages.clear()
+
     # ── 4. 조판 ──────────────────────────────
     log("[4/4] PDF 조판")
-    translations = []
+    out_pages, translations, kept_original = [], [], []
     for i in range(n):
         p = pages[i]
+        d = direct.get(str(i))
+        if d and not d.get("blocked"):
+            out_pages.append(d)
+            translations.append([b["text"] for b in d["blocks"]])
+            continue
+        out_pages.append(p)
         t = work["translations"].get(str(i))
         if p["page_kind"] == "failed" or (t is None and p["page_kind"] not in NO_TRANSLATE and p["blocks"]):
             translations.append(None)       # 원문 페이지로 대체
+            kept_original.append(i + 1)
         else:
             translations.append(t or [""] * len(p["blocks"]))
-    out = render_book(src, pages, translations, g)
+    out = render_book(src, out_pages, translations, g)
     src.close()
 
+    n_direct = sum(1 for d in direct.values() if d and not d.get("blocked"))
+    if n_direct:
+        log(f"  보조 번역으로 처리된 페이지: {n_direct}쪽")
     report = {
         "pages": n,
         "seconds": round(time.time() - t0),
-        "failed_pages": sorted({i + 1 for i in failed_ocr + failed_tr}
-                               | {int(k) + 1 for k, v in work["pages"].items() if v.get("blocked")}
-                               | {int(k) + 1 for k, v in work["translations"].items() if v is None}),
+        "failed_pages": kept_original,
+        "direct_pages": n_direct,
         "title": g.get("title", ""),
         "author": g.get("author", ""),
     }
